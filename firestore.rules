@@ -1,0 +1,84 @@
+rules_version = '2';
+
+// Security model
+//  - Anything that must be trusted (age verification, wallet ownership, membership state,
+//    vouchers, redemption records) is written ONLY by Cloud Functions via the Admin SDK,
+//    which bypasses these rules. Clients can never set those fields.
+//  - `member` and `staff` custom claims are set by the `linkWallet`/`refreshMembership`
+//    functions after checking the chain (staff == holds MANAGER_ROLE on the contract).
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+    function isSelf(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+    function isStaff() {
+      return signedIn() && request.auth.token.staff == true;
+    }
+    // Fields a member may edit on their own profile.
+    function onlyProfileFields() {
+      return request.resource.data.diff(resource.data).affectedKeys()
+        .hasOnly(['displayName', 'shipping', 'phone', 'updatedAt']);
+    }
+    function validShipping(s) {
+      return s is map
+        && s.keys().hasOnly(['name', 'line1', 'line2', 'city', 'state', 'zip', 'country'])
+        && s.name is string && s.name.size() <= 120
+        && s.line1 is string && s.line1.size() <= 200
+        && s.city is string && s.city.size() <= 120
+        && s.state is string && s.state.size() <= 60
+        && s.zip is string && s.zip.size() <= 20;
+    }
+
+    match /users/{uid} {
+      allow read: if isSelf(uid) || isStaff();
+      // First write creates a shell profile; trusted fields cannot be included.
+      allow create: if isSelf(uid)
+        && request.resource.data.keys().hasOnly(['displayName', 'email', 'shipping', 'phone', 'createdAt', 'updatedAt'])
+        && (!('shipping' in request.resource.data) || validShipping(request.resource.data.shipping));
+      allow update: if isSelf(uid)
+        && onlyProfileFields()
+        && (!('shipping' in request.resource.data) || validShipping(request.resource.data.shipping));
+      allow delete: if false;
+    }
+
+    // Off-chain enrichment for on-chain perks (title, copy, image). Keyed by on-chain perkId.
+    match /perks/{perkId} {
+      allow read: if true;
+      allow write: if isStaff();
+    }
+
+    // Off-chain enrichment for tiers (copy, artwork). Keyed by on-chain tierId.
+    match /tiers/{tierId} {
+      allow read: if true;
+      allow write: if isStaff();
+    }
+
+    // Created only by the recordRedemption function after verifying the tx on-chain.
+    match /redemptions/{id} {
+      allow read: if isStaff() || (signedIn() && resource.data.uid == request.auth.uid);
+      allow create, delete: if false;
+      // Staff may only move fulfilment status / notes; never rewrite chain facts.
+      allow update: if isStaff()
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['status', 'fulfilmentNotes', 'trackingNumber', 'updatedAt', 'fulfilledBy'])
+        && request.resource.data.status in ['pending', 'ready', 'shipped', 'fulfilled', 'cancelled'];
+    }
+
+    // Function-only collections.
+    match /vouchers/{nonce} {
+      allow read: if isStaff();
+      allow write: if false;
+    }
+    match /linkNonces/{uid} {
+      allow read, write: if false;
+    }
+    match /ageVerifications/{uid} {
+      allow read: if isStaff();
+      allow write: if false;
+    }
+  }
+}
